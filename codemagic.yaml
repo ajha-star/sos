@@ -1,0 +1,16 @@
+workflows:
+  sos-android-debug:
+    name: SOS Button debug APK
+    max_build_duration: 30
+    instance_type: linux_x2
+    environment:
+      java: 17
+    scripts:
+      - name: Set Android SDK path
+        script: echo "sdk.dir=$ANDROID_SDK_ROOT" > "$CM_BUILD_DIR/local.properties"
+      - name: Create Gradle wrapper
+        script: gradle wrapper --gradle-version 8.9
+      - name: Build debug APK
+        script: ./gradlew assembleDebug
+    artifacts:
+      - app/build/outputs/**/*.apk
