@@ -201,8 +201,10 @@ class SosService : Service() {
         return if (loc != null) {
             val lat = String.format(Locale.US, "%.6f", loc.latitude)
             val lon = String.format(Locale.US, "%.6f", loc.longitude)
-            "HELP! I am in danger. My location: https://maps.google.com/?q=$lat,$lon " +
-                "(accuracy about ${loc.accuracy.toInt()} m)"
+            // Link on its own line, comma encoded as %2C, so SMS apps do not cut it at the comma.
+            "HELP! I am in danger. My location:\n" +
+                "https://www.google.com/maps/search/?api=1&query=$lat%2C$lon\n" +
+                "($lat, $lon, accuracy about ${loc.accuracy.toInt()} m)"
         } else {
             "HELP! I am in danger. My location could not be found. Please call me now."
         }
