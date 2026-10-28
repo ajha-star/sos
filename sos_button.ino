@@ -1,84 +1,192 @@
-// SOS Button Prototype - ESP32 + phone over Bluetooth
-// Works with the original ESP32 / ESP32-S boards (classic Bluetooth).
-// NOT for ESP32-S3 or ESP32-C3 (they have no classic Bluetooth).
+// SOS Button - ESP32 + Android phone over classic Bluetooth
+// Works with the original ESP32 / ESP32-S boards. NOT ESP32-S3 / C3 (no classic Bluetooth).
 //
-// Wiring:
-//   SOS button    : GPIO 4  -> button -> GND
-//   Cancel button : GPIO 5  -> button -> GND
-//   Motor 1       : GPIO 18 -> 1k resistor -> NPN base
-//   Motor 2       : GPIO 19 -> 1k resistor -> NPN base
-//   Each motor    : one wire to 3V3, other wire to NPN collector
-//                   NPN emitter -> GND
-//                   Diode across motor (stripe/cathode to 3V3)
+// Wiring (each LED: GPIO -> 220 ohm resistor -> LED long leg; LED short leg -> GND):
+//   SOS button  : GPIO 4  -> button -> GND
+//   SAFE button : GPIO 5  -> button -> GND
+//   Red LED     : GPIO 22
+//   Green LED   : GPIO 19
+//
+// ESP32 -> phone : SOS, SAFE
+// phone -> ESP32 : SENDING, SENT, FAIL, SAFE_SENDING, SAFE_SENT, ENDED
+//
+// LED language:
+//   not connected to phone      : red blinks slowly and continuously
+//   phone app connects          : red + green solid for 3 seconds
+//   SOS / update sending        : red solid
+//   SOS / update sent           : red off, green solid for 2 seconds
+//   "I am safe" sending         : green blinks
+//   "I am safe" sent            : green blinks for 3 seconds
+//   any failure / no answer     : red blinks fast 6 times
 
 #include "BluetoothSerial.h"
 
 BluetoothSerial SerialBT;
 
 const int SOS_PIN = 4;
-const int CANCEL_PIN = 5;
-const int MOTOR1_PIN = 18;
-const int MOTOR2_PIN = 19;
+const int SAFE_PIN = 5;
+const int RED_LED = 22;
+const int GREEN_LED = 19;
 
-const unsigned long HOLD_TIME = 2000;  // hold SOS button for 2 seconds
+const unsigned long GREEN_HOLD_MS = 2000;      // green stays on this long after "sent"
+const unsigned long CONNECT_HOLD_MS = 3000;    // both LEDs solid after Bluetooth connects
+const unsigned long SAFE_DONE_MS = 3000;       // green blinks this long after "I am safe" is sent
+const unsigned long RESPONSE_TIMEOUT = 30000;  // give up if the phone never answers
+const int FAIL_BLINKS = 6;                     // red blinks on failure (5 to 7)
+const unsigned long DEBOUNCE_MS = 40;
 
-unsigned long pressStart = 0;
-bool sosSent = false;
+enum Mode { M_OFF, M_RED_ON, M_GREEN_2S, M_SAFE_SENDING, M_FAIL, M_CONNECTED, M_DISCONNECTED, M_SAFE_DONE };
+Mode mode = M_DISCONNECTED;
+unsigned long modeStart = 0;
 
-void vibrate(int times, int onMs, int offMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(MOTOR1_PIN, HIGH);
-    digitalWrite(MOTOR2_PIN, HIGH);
-    delay(onMs);
-    digitalWrite(MOTOR1_PIN, LOW);
-    digitalWrite(MOTOR2_PIN, LOW);
-    delay(offMs);
+bool wasConnected = false;
+bool alertActive = false;  // true after SOS is sent until Safe / end / disconnect
+String rx = "";
+
+// One debounced button: pressed() returns true once per physical press.
+struct Button {
+  int pin;
+  int lastRaw;
+  unsigned long change;
+  bool latched;
+  bool pressed() {
+    int raw = digitalRead(pin);
+    if (raw != lastRaw) {
+      lastRaw = raw;
+      change = millis();
+    }
+    if (millis() - change >= DEBOUNCE_MS) {
+      if (raw == LOW && !latched) {
+        latched = true;
+        return true;
+      }
+      if (raw == HIGH) latched = false;
+    }
+    return false;
+  }
+};
+
+Button sosButton = {SOS_PIN, HIGH, 0, false};
+Button safeButton = {SAFE_PIN, HIGH, 0, false};
+
+void setMode(Mode m) {
+  mode = m;
+  modeStart = millis();
+}
+
+void leds(bool red, bool green) {
+  digitalWrite(RED_LED, red ? HIGH : LOW);
+  digitalWrite(GREEN_LED, green ? HIGH : LOW);
+}
+
+void updateLeds() {
+  unsigned long t = millis() - modeStart;
+  switch (mode) {
+    case M_OFF:
+      leds(false, false);
+      break;
+    case M_RED_ON:
+      leds(true, false);
+      if (t > RESPONSE_TIMEOUT) {
+        alertActive = false;
+        setMode(M_FAIL);
+      }
+      break;
+    case M_GREEN_2S:
+      leds(false, true);
+      if (t >= GREEN_HOLD_MS) setMode(M_OFF);
+      break;
+    case M_SAFE_SENDING:
+      leds(false, (t / 200) % 2 == 0);
+      if (t > RESPONSE_TIMEOUT) setMode(M_FAIL);
+      break;
+    case M_FAIL:
+      leds((t % 400) < 200, false);
+      if (t >= (unsigned long)FAIL_BLINKS * 400) setMode(M_OFF);
+      break;
+    case M_CONNECTED:
+      leds(true, true);
+      if (t >= CONNECT_HOLD_MS) setMode(M_OFF);
+      break;
+    case M_DISCONNECTED:
+      leds((t % 1000) < 500, false);
+      break;
+    case M_SAFE_DONE:
+      leds(false, (t / 200) % 2 == 0);
+      if (t >= SAFE_DONE_MS) setMode(M_OFF);
+      break;
+  }
+}
+
+void handleMessage(const String &m) {
+  Serial.print("From phone: ");
+  Serial.println(m);
+  if (m == "SENDING") setMode(M_RED_ON);
+  else if (m == "SENT") setMode(M_GREEN_2S);
+  else if (m == "FAIL") setMode(M_FAIL);
+  else if (m == "SAFE_SENDING") setMode(M_SAFE_SENDING);
+  else if (m == "SAFE_SENT") {
+    alertActive = false;
+    setMode(M_SAFE_DONE);
+  } else if (m == "ENDED") {
+    alertActive = false;
+    setMode(M_OFF);
+  }
+}
+
+void readBluetooth() {
+  while (SerialBT.available()) {
+    char c = (char)SerialBT.read();
+    if (c == '\n') {
+      rx.trim();
+      if (rx.length() > 0) handleMessage(rx);
+      rx = "";
+    } else if (c != '\r') {
+      if (rx.length() < 32) rx += c;
+    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(SOS_PIN, INPUT_PULLUP);
-  pinMode(CANCEL_PIN, INPUT_PULLUP);
-  pinMode(MOTOR1_PIN, OUTPUT);
-  pinMode(MOTOR2_PIN, OUTPUT);
+  pinMode(SAFE_PIN, INPUT_PULLUP);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  leds(false, false);
 
   SerialBT.begin("SOS_Button");  // name that shows in phone Bluetooth list
+  setMode(M_DISCONNECTED);
   Serial.println("Ready. Pair your phone with SOS_Button");
-  vibrate(1, 200, 0);  // one buzz = powered on
 }
 
 void loop() {
-  // 1. SOS button: hold for 2 seconds
-  if (digitalRead(SOS_PIN) == LOW) {
-    if (pressStart == 0) pressStart = millis();
-    if (!sosSent && millis() - pressStart >= HOLD_TIME) {
+  bool connected = SerialBT.hasClient();
+  if (connected != wasConnected) {
+    wasConnected = connected;
+    rx = "";
+    alertActive = false;
+    setMode(connected ? M_CONNECTED : M_DISCONNECTED);
+    Serial.println(connected ? "Phone connected" : "Phone disconnected");
+  }
+
+  bool sosPressed = sosButton.pressed();
+  bool safePressed = safeButton.pressed();
+
+  if (connected) {
+    if (sosPressed && !alertActive) {  // one tap starts the alert
       SerialBT.println("SOS");
       Serial.println("SOS sent to phone");
-      vibrate(1, 500, 0);  // long buzz = trigger accepted
-      sosSent = true;
+      alertActive = true;
+      setMode(M_RED_ON);
     }
-  } else {
-    pressStart = 0;
-    sosSent = false;
+    if (safePressed) {  // the phone ignores SAFE when no alert is running
+      SerialBT.println("SAFE");
+      Serial.println("SAFE sent to phone");
+    }
+    readBluetooth();
   }
 
-  // 2. Cancel button: false alarm
-  if (digitalRead(CANCEL_PIN) == LOW) {
-    SerialBT.println("CANCEL");
-    Serial.println("CANCEL sent to phone");
-    vibrate(2, 100, 100);
-    delay(500);  // simple debounce
-  }
-
-  // 3. Messages from the phone
-  if (SerialBT.available()) {
-    String msg = SerialBT.readStringUntil('\n');
-    msg.trim();
-    if (msg == "SENT") {
-      vibrate(3, 150, 150);  // three buzzes = message sent
-    } else if (msg == "FAIL") {
-      vibrate(5, 80, 80);    // five quick buzzes = failed, try again
-    }
-  }
+  updateLeds();
+  delay(2);
 }

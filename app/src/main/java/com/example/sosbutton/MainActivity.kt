@@ -93,7 +93,10 @@ class MainActivity : Activity() {
 
         addButton("1. Allow permissions") { askPermissions() }
         addButton("2. Save numbers and START protection") { startProtection(false) }
-        addButton("Send TEST SOS now") { startProtection(true) }
+        addButton("Send TEST SOS now (repeats until I AM SAFE)") { startProtection(true) }
+        addButton("I AM SAFE (stop alert)") {
+            startService(Intent(this, SosService::class.java).setAction(SosService.ACTION_SAFE))
+        }
         addButton("Stop protection") {
             startService(Intent(this, SosService::class.java).setAction(SosService.ACTION_STOP))
         }
